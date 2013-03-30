@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -13,54 +14,65 @@ import (
 
 var _ = time.Second
 
-func read_ptrace_events(cmd *exec.Cmd) chan *syscall.PtraceRegs {
+func read_ptrace_events(args []string) (*exec.Cmd, func() *syscall.PtraceRegs) {
+
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Start()
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = cmd.Process.Wait()
+	if err != nil {
+		panic(err)
+	}
 
 	child := cmd.Process.Pid
-	err := syscall.PtraceSetOptions(child, syscall.PTRACE_O_TRACESYSGOOD)
+
+	err = syscall.PtraceSetOptions(child, syscall.PTRACE_O_TRACESYSGOOD)
 	if err != nil {
 		panic(err)
 	}
 
 	var regs syscall.PtraceRegs
 
-	ev := make(chan *syscall.PtraceRegs)
-	go func() {
-		for {
-			err = syscall.PtraceSyscall(child, 0)
-			if err != nil {
-				panic(err)
-			}
-			state, err := cmd.Process.Wait()
-			if err != nil {
-				panic(err)
-			}
-			waitstatus, ok := state.Sys().(syscall.WaitStatus)
-			if !ok {
-				panic(err)
-			}
-			if waitstatus.Exited() {
-				// Process quit
-				break
-			}
-			if !waitstatus.Stopped() {
-				panic("Not handled: process isn't sigstopped!")
-			}
-			sig := waitstatus.StopSignal()
-			if sig&0x80 == 0 {
-				// Not something we're build to handle
-				// High bit should be set for syscalls because of PTRACE_O_SYSGOOD
-				continue
-			}
-			err = syscall.PtraceGetRegs(child, &regs)
-			if err != nil {
-				panic(err)
-			}
-			ev <- &regs
-			<-ev
+	return cmd, func() *syscall.PtraceRegs {
+
+		err = syscall.PtraceSyscall(child, 0)
+		if err != nil {
+			panic(err)
 		}
-		ev <- nil
-	}()
-	return ev
+		state, err := cmd.Process.Wait()
+		if err != nil {
+			panic(err)
+		}
+		waitstatus, ok := state.Sys().(syscall.WaitStatus)
+		if !ok {
+			panic(err)
+		}
+		if waitstatus.Exited() {
+			// Process quit
+			return nil
+		}
+		if !waitstatus.Stopped() {
+			panic("Not handled: process isn't sigstopped!")
+		}
+		sig := waitstatus.StopSignal()
+		if sig&0x80 == 0 {
+			// Not something we're build to handle
+			// High bit should be set for syscalls because of PTRACE_O_SYSGOOD
+			return nil
+		}
+		err = syscall.PtraceGetRegs(child, &regs)
+		if err != nil {
+			panic(err)
+		}
+		return &regs
+	}
 }
 
 type File struct {
@@ -94,43 +106,34 @@ func (f *File) Show() {
 }
 
 func main() {
+	runtime.LockOSThread()
 
 	flag.Parse()
 	args := flag.Args()
 	log.Printf("Starting program %v", args)
 
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
-	cmd.Stdout = os.Stdout
-	err := cmd.Start()
-	if err != nil {
-		panic(err)
-	}
-
-	event := read_ptrace_events(cmd)
+	cmd, wait_syscall := read_ptrace_events(args)
 
 	var buf [1024]byte
 
 	var filemap = map[uintptr]*File{}
 
 	for {
-		regs := <-event
+		regs := wait_syscall()
 		if regs == nil {
 			break
 		}
-		call := regs.Orig_rax
+		call, args := syscall_params(regs)
 		callname := strings.ToLower(syscall_name(call)[4:])
+		//log.Printf("call %d", call)
 		_ = callname
 
-		var args = [6]uint64{regs.Rdi, regs.Rsi, regs.Rdx, regs.Rcx, regs.R8, regs.R9}
-		event <- nil
-
 		// Return of syscall
-		regs = <-event
+		regs = wait_syscall()
 		if regs == nil {
 			break
 		}
-		retval := int64(regs.Rax)
+		retval := syscall_retval(regs)
 
 		interesting := true
 
@@ -178,15 +181,10 @@ func main() {
 			fd := uintptr(args[0])
 			//log.Printf("fd = %v", fd)
 			if _, ok := filemap[fd]; !ok {
+				break sw
 				log.Panic("fd not in file map: ", fd)
 			}
 			f := filemap[fd]
-
-			// Only count every 10th read
-			f.N += 1
-			if f.N%10 != 1 {
-				break sw
-			}
 
 			rfp := &f.read_file_pieces
 			pos := f.pos
@@ -203,7 +201,7 @@ func main() {
 
 			// Only keep the last 100 reads
 			f.decay = append(f.decay, pos)
-			if len(f.decay) > 100 {
+			if len(f.decay) > 1 {
 				if _, ok := (*rfp)[f.decay[0]]; ok {
 					delete(*rfp, f.decay[0])
 				}
@@ -260,8 +258,6 @@ func main() {
 			//time.Sleep(10*time.Millisecond)
 		}
 
-		event <- nil
 	}
 
-	err = cmd.Wait()
 }
