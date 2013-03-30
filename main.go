@@ -14,6 +14,9 @@ import (
 
 var _ = time.Second
 
+var verbose = flag.Bool("verbose", false, "show system calls")
+var delay = flag.Duration("delay", 0, "slow down execution by given duration per interesting syscall")
+
 func read_ptrace_events(args []string) (*exec.Cmd, func() *syscall.PtraceRegs) {
 
 	cmd := exec.Command(args[0], args[1:]...)
@@ -97,12 +100,12 @@ func (f *File) Show() {
 			if fsize < 1 {
 				fsize = 1
 			}
-			for i := 0; i < fsize && fpos+i < N; i++ {
+			for i := 0; i <= fsize && fpos+i < N; i++ {
 				pieces[fpos+i] = '#'
 			}
 		}
 	}
-	log.Printf("%50s [%s]", f.path, string(pieces))
+	log.Printf("%30s [%s]", f.path, string(pieces))
 }
 
 func main() {
@@ -110,7 +113,10 @@ func main() {
 
 	flag.Parse()
 	args := flag.Args()
-	log.Printf("Starting program %v", args)
+
+	if *verbose {
+		log.Printf("Starting program %v", args)
+	}
 
 	cmd, wait_syscall := read_ptrace_events(args)
 
@@ -156,7 +162,10 @@ func main() {
 			// For the moment hide failed opens
 			if retval >= 0 {
 				_ = errno
-				//log.Printf("open(path=%v, flags=0x%x, mode=0x%x) -> fd=%v e=%v", path, args[1], args[2], retval, errno)
+				if *verbose {
+					log.Printf("open(path=%v, flags=0x%x, mode=0x%x) -> fd=%v e=%v",
+						path, args[1], args[2], retval, errno)
+				}
 			} else {
 				interesting = false
 			}
@@ -171,7 +180,10 @@ func main() {
 			}
 
 		case syscall.SYS_READ:
-			//log.Printf("read(fd=%v, buf=0x%x, bufsize=%v) -> ret=%v", args[0], args[1], args[2], retval)
+			if *verbose {
+				log.Printf("read(fd=%v, buf=0x%x, bufsize=%v) -> ret=%v",
+					args[0], args[1], args[2], retval)
+			}
 
 			if retval < 0 {
 				interesting = false
@@ -179,16 +191,15 @@ func main() {
 			}
 
 			fd := uintptr(args[0])
-			//log.Printf("fd = %v", fd)
 			if _, ok := filemap[fd]; !ok {
+				// stdin?
 				break sw
-				log.Panic("fd not in file map: ", fd)
+				//log.Panic("fd not in file map: ", fd)
 			}
 			f := filemap[fd]
 
 			rfp := &f.read_file_pieces
 			pos := f.pos
-			//log.Printf("  current pos: %v, size = %v", pos, retval)
 			if size, present := (*rfp)[pos]; present {
 				if retval > size {
 					// this read is at the same place but larger, so it over-rides
@@ -199,7 +210,7 @@ func main() {
 				(*rfp)[pos] = retval
 			}
 
-			// Only keep the last 100 reads
+			// Only keep the last N reads
 			f.decay = append(f.decay, pos)
 			if len(f.decay) > 1 {
 				if _, ok := (*rfp)[f.decay[0]]; ok {
@@ -209,24 +220,30 @@ func main() {
 			}
 
 			f.pos += retval
-			//log.Printf("  new pos: %v, size = %v", filemap[fd].pos, retval)
 
 			f.Show()
 
 		case syscall.SYS_READV:
-			log.Printf("readv(fd=%v, buf=0x%x, bufsize=%v) -> ret=%v", args[0], args[1], args[2], retval)
+			if *verbose {
+				log.Printf("readv(fd=%v, buf=0x%x, bufsize=%v) -> ret=%v",
+					args[0], args[1], args[2], retval)
+			}
 
 			fd := uintptr(args[0])
 			filemap[fd].pos += retval
 
 		case syscall.SYS_PREAD64:
-			log.Printf("pread64(fd=%v, buf=0x%x, bufsize=%v) -> ret=%v", args[0], args[1], args[2], retval)
+			log.Printf("pread64(fd=%v, buf=0x%x, bufsize=%v, offset=%v) -> ret=%v",
+				args[0], args[1], args[2], args[3], retval)
 
 			fd := uintptr(args[0])
 			filemap[fd].pos += retval
 
 		case syscall.SYS_LSEEK:
-			//log.Printf("lseek(fd=%v, offset=%v, whence=%v) -> ret=%v", args[0], args[1], args[2], retval)
+			if *verbose {
+				log.Printf("lseek(fd=%v, offset=%v, whence=%v) -> ret=%v",
+					args[0], args[1], args[2], retval)
+			}
 
 			fd := uintptr(args[0])
 			offset := int64(args[1])
@@ -242,11 +259,12 @@ func main() {
 			}
 
 		case syscall.SYS_CLOSE:
-			//log.Printf("close(fd=%x) = %v", args[0], retval)
+			if *verbose {
+				log.Printf("close(fd=%x) = %v", args[0], retval)
+			}
 			fd := uintptr(args[0])
-			if retval >= 0 {
-				_ = fd
-				//delete(filemap, fd)
+			if retval >= 0 && fd > 2 {
+				delete(filemap, fd)
 			}
 
 		default:
@@ -254,8 +272,7 @@ func main() {
 		}
 
 		if interesting {
-			//time.Sleep(250*time.Millisecond)
-			//time.Sleep(10*time.Millisecond)
+			time.Sleep(*delay)
 		}
 
 	}
