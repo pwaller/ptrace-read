@@ -252,6 +252,10 @@ func main() {
 			case os.SEEK_SET:
 				filemap[fd].pos = offset
 			case os.SEEK_CUR:
+				if _, ok := filemap[fd]; !ok {
+					log.Printf("knoown FD: %d", fd)
+					break
+				}
 				filemap[fd].pos += offset
 			case os.SEEK_END:
 				//
